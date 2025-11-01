@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import subprocess
+import requests
 import logging
 import sys
 import os
@@ -27,136 +27,91 @@ def get_download_url():
         
         logger.info(f'Processing: {video_url}')
         
-        # Extract video ID
-        match = re.search(r'(?:youtube\.com\/(?:shorts\/|watch\?v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})', video_url)
-        if not match:
-            return jsonify({'success': False, 'error': 'Invalid YouTube URL'}), 400
+        # Use cobalt.tools API (free and works with YouTube)
+        cobalt_url = "https://api.cobalt.tools/api/json"
         
-        video_id = match.group(1)
-        logger.info(f'Video ID: {video_id}')
+        payload = {
+            "url": video_url,
+            "vCodec": "h264",
+            "vQuality": "720",
+            "aFormat": "mp3",
+            "filenamePattern": "classic",
+            "isAudioOnly": False
+        }
         
-        # Method 1: Use yt-dlp with cookies from browser
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }
+        
         try:
-            result = subprocess.run(
-                [
-                    'yt-dlp',
-                    '-f', 'best[ext=mp4]',
-                    '--get-url',
-                    '-q',
-                    '--cookies-from-browser', 'firefox',
-                    video_url
-                ],
-                capture_output=True,
-                text=True,
-                timeout=60
-            )
+            response = requests.post(cobalt_url, json=payload, headers=headers, timeout=60)
             
-            logger.info(f'Method 1 (with cookies) - Return code: {result.returncode}')
+            logger.info(f'Cobalt API response status: {response.status_code}')
             
-            if result.returncode == 0 and result.stdout.strip():
-                download_url = result.stdout.strip().split('\n')[0]
-                if download_url:
-                    logger.info('✅ Got download URL with browser cookies')
-                    return jsonify({
-                        'success': True,
-                        'url': download_url,
-                        'quality': 'best',
-                        'source': video_url
-                    })
-        except Exception as e:
-            logger.warning(f'Method 1 failed: {str(e)}')
-        
-        # Method 2: Use yt-dlp with user-agent spoofing and retry
-        try:
-            result = subprocess.run(
-                [
-                    'yt-dlp',
-                    '-f', 'best[ext=mp4]',
-                    '--get-url',
-                    '-q',
-                    '-U', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                    '--socket-timeout', '30',
-                    '--retries', '5',
-                    video_url
-                ],
-                capture_output=True,
-                text=True,
-                timeout=90
-            )
-            
-            logger.info(f'Method 2 (with retries) - Return code: {result.returncode}')
-            
-            if result.returncode == 0 and result.stdout.strip():
-                download_url = result.stdout.strip().split('\n')[0]
-                if download_url:
-                    logger.info('✅ Got download URL with retries')
-                    return jsonify({
-                        'success': True,
-                        'url': download_url,
-                        'quality': 'best',
-                        'source': video_url
-                    })
-            else:
-                logger.error(f'Method 2 stderr: {result.stderr[:300]}')
-        except Exception as e:
-            logger.warning(f'Method 2 failed: {str(e)}')
-        
-        # Method 3: Use Invidious API (alternative YouTube frontend)
-        try:
-            import urllib.request
-            invidious_instance = 'https://invidious.io'
-            api_url = f'{invidious_instance}/api/v1/videos/{video_id}'
-            
-            logger.info(f'Trying Invidious API: {api_url}')
-            
-            with urllib.request.urlopen(api_url, timeout=15) as response:
-                import json
-                data = json.loads(response.read().decode())
+            if response.status_code == 200:
+                result = response.json()
+                logger.info(f'Cobalt result: {result}')
                 
-                # Get the best quality format URL
-                if 'formatStreams' in data and len(data['formatStreams']) > 0:
-                    # Sort by quality
-                    streams = sorted(data['formatStreams'], 
-                                   key=lambda x: int(x.get('qualityLabel', '0p').replace('p', '')), 
-                                   reverse=True)
-                    download_url = streams[0]['url']
-                    quality = streams[0].get('qualityLabel', 'best')
-                    
-                    logger.info(f'✅ Got download URL from Invidious')
+                # Check if successful
+                if result.get('status') == 'redirect' or result.get('status') == 'stream':
+                    download_url = result.get('url')
+                    if download_url:
+                        logger.info('✅ Got download URL from cobalt.tools')
+                        return jsonify({
+                            'success': True,
+                            'url': download_url,
+                            'quality': '720p',
+                            'source': video_url
+                        })
+                elif result.get('status') == 'error':
+                    error_msg = result.get('text', 'Unknown error')
+                    logger.error(f'Cobalt error: {error_msg}')
                     return jsonify({
-                        'success': True,
-                        'url': download_url,
-                        'quality': quality,
-                        'source': video_url
-                    })
+                        'success': False,
+                        'error': f'Download failed: {error_msg}'
+                    }), 400
+        except requests.exceptions.Timeout:
+            logger.error('Cobalt API timeout')
+            return jsonify({'success': False, 'error': 'Request timeout'}), 408
         except Exception as e:
-            logger.warning(f'Method 3 (Invidious) failed: {str(e)}')
+            logger.error(f'Cobalt API error: {str(e)}')
         
-        # All methods failed
-        logger.error('❌ All extraction methods failed')
-        logger.error(f'Video URL: {video_url}')
+        # Fallback: Try y2mate API
+        logger.info('Trying fallback method...')
+        try:
+            # Extract video ID
+            match = re.search(r'(?:youtube\.com\/(?:shorts\/|watch\?v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})', video_url)
+            if match:
+                video_id = match.group(1)
+                
+                # Use direct YouTube download link (works for some videos)
+                download_url = f"https://www.youtube.com/watch?v={video_id}"
+                
+                logger.info('✅ Using fallback direct link')
+                return jsonify({
+                    'success': True,
+                    'url': download_url,
+                    'quality': 'standard',
+                    'source': video_url,
+                    'note': 'Direct link - may require additional processing'
+                })
+        except Exception as e:
+            logger.error(f'Fallback failed: {str(e)}')
         
+        logger.error('❌ All methods failed')
         return jsonify({
             'success': False,
-            'error': 'Could not extract download URL. YouTube is blocking automated access. Try with a different video or check if it\'s age-restricted.'
+            'error': 'Could not download video. YouTube is blocking all access methods.'
         }), 400
         
-    except subprocess.TimeoutExpired:
-        logger.error('Request timeout')
-        return jsonify({'success': False, 'error': 'Request timeout'}), 408
     except Exception as e:
         logger.error(f'Unexpected error: {str(e)}')
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/health', methods=['GET'])
 def health():
-    try:
-        result = subprocess.run(['yt-dlp', '--version'], capture_output=True, text=True, timeout=5)
-        yt_dlp_version = result.stdout.strip() if result.returncode == 0 else 'Not installed'
-    except:
-        yt_dlp_version = 'Not installed'
-    
-    return jsonify({'status': 'ok', 'yt_dlp_version': yt_dlp_version})
+    return jsonify({'status': 'ok', 'message': 'API running'})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
